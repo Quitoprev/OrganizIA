@@ -310,12 +310,14 @@ const short=v=>Math.abs(v)>=1000?(v/1000).toLocaleString('pt-BR',{maximumFractio
 
 /* ============ armazenamento ============ */
 const LS='organizia-v1';
-let DB={}, dirty={}, col=null, memo={}, synced=false, PREVIEW=false;
-function lsSave(){try{localStorage.setItem(LS,JSON.stringify(Object.values(DB)))}catch(e){}}
+let DB={}, dirty={}, col=null, memo={}, synced=false;
+/* CARREGANDO: no Claude, espera a conta responder antes de mostrar qualquer tela que grave. LSOK: o navegador aceitou gravar. */
+let CARREGANDO=false, CARGA='Buscando na sua conta.', LSOK=true;
+function lsSave(){try{localStorage.setItem(LS,JSON.stringify(Object.values(DB)));LSOK=true}catch(e){LSOK=false}}
 function lsLoad(){try{const a=JSON.parse(localStorage.getItem(LS)||'[]');for(const o of a)if(o&&o.id)DB[o.id]=o}catch(e){}}
 const clean=o=>JSON.parse(JSON.stringify(o));
-function put(o){o=clean(o);DB[o.id]=o;memo={};if(PREVIEW)return;dirty[o.id]=o;lsSave();queue(o.id)}
-function del(id){delete DB[id];memo={};if(PREVIEW)return;dirty[id]=null;lsSave();queue(id)}
+function put(o){o=clean(o);DB[o.id]=o;memo={};dirty[o.id]=o;lsSave();queue(o.id)}
+function del(id){delete DB[id];memo={};dirty[id]=null;lsSave();queue(id)}
 const Q=new Set(); let flushing=false, fails=0;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const stable=v=>Array.isArray(v)?'['+v.map(stable).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}':JSON.stringify(v);
@@ -339,32 +341,34 @@ async function flush(){
   }finally{flushing=false}
 }
 async function connectDb(){
+  const local=()=>{if(CARREGANDO){CARREGANDO=false;render()}};   /* não há conta para consultar: segue no navegador */
   try{
-    if(!window.claude||!claude.use)return;
+    if(!window.claude||!claude.use)return local();
     const [db,user]=await Promise.all([claude.use('db'),claude.use('user')]);
-    if(!db||!user)return;
-    const id=await user.id(); if(!id)return;
+    if(!db||!user)return local();
+    const id=await user.id(); if(!id)return local();
     const c=db.collection('data/users/'+id);
     let first=true;
-    const timer=setTimeout(()=>{if(!synced)setSync('Sem conexão com a conta; salvo neste navegador',false)},10000);
+    /* a conta existe mas ainda não respondeu: continua esperando. Criar dados locais agora poderia se misturar aos da conta. */
+    const timer=setTimeout(()=>{if(!synced)setSync('Sem conexão com a conta; salvo neste navegador',false);if(CARREGANDO){CARGA='A conta está demorando a responder. Assim que ela responder, seus dados aparecem aqui.';render()}},10000);
     c.onSnapshot(snap=>{
       const fresh=!snap.metadata.fromCache;
       if(first&&!fresh&&snap.empty)return;
       let force=false;
       if(first&&fresh){
         first=false; clearTimeout(timer); col=c; synced=true; setSync('Sincronizado na sua conta',true); force=true;
-        if(snap.empty&&!PREVIEW&&Object.keys(DB).length){ for(const o of Object.values(DB)){dirty[o.id]=o;Q.add(o.id)} flush(); render(); return; }
+        if(snap.empty){ CARREGANDO=false; for(const o of Object.values(DB)){dirty[o.id]=o;Q.add(o.id)} flush(); render(); return; }
         for(const id of Object.keys(dirty))Q.add(id); flush();
       }
       if(!col)col=c;
       const next={}; for(const d of snap.docs){const v=d.data();if(v)next[d.id]=clean(v)}
       for(const [k,v] of Object.entries(dirty)){ if(v)next[k]=v; else delete next[k]; }
       const ka=Object.keys(next);
-      if(PREVIEW){ if(!ka.length){ if(force)render(); return } PREVIEW=false; force=true }
+      if(CARREGANDO){ if(!ka.length)return; CARREGANDO=false; force=true }
       if(!force&&ka.length===Object.keys(DB).length&&ka.every(k=>DB[k]&&stable(DB[k])===stable(next[k])))return;
       DB=next; memo={}; lsSave(); render(); setTimeout(expandInbox,0);
-    },err=>{clearTimeout(timer);setSync('Salvo neste navegador',false)});
-  }catch(e){console.warn(e)}
+    },err=>{clearTimeout(timer);setSync('Salvo neste navegador',false);local()});
+  }catch(e){console.warn(e);local()}
 }
 let SAMPLE=null;
 function connectAi(){try{if(window.claude&&claude.use)claude.use('sample').then(s=>{SAMPLE=s||null},()=>{})}catch(e){}}
@@ -375,7 +379,7 @@ function setSync(t,on){const s=$('#sync');if(!s)return;s.classList.toggle('on',o
 let inboxBusy=false;
 const settled=async ids=>{for(let i=0;i<720;i++){if(!col||!ids.some(id=>id in dirty))return;await sleep(250)}throw new Error('lote ainda não confirmado')};
 async function expandInbox(){
-  if(inboxBusy||PREVIEW)return; const boxes=L('inbox').filter(b=>!b.err); if(!boxes.length)return; inboxBusy=true; let done=0;
+  if(inboxBusy||CARREGANDO)return; const boxes=L('inbox').filter(b=>!b.err); if(!boxes.length)return; inboxBusy=true; let done=0;
   try{
     for(const b of boxes){
       const rows=Array.isArray(b.rows)?b.rows:[], K={d:'despesa',r:'receita',a:'aporte',g:'resgate',i:'transf',o:'transf'};
@@ -848,18 +852,19 @@ function vWelcome(){
   return `<div class="welcome"><svg width="56" height="56" viewBox="0 0 34 34" aria-hidden="true"><circle cx="17" cy="18" r="14" fill="#5d2366"/><circle cx="12" cy="13" r="3.4" fill="#fff" opacity=".22"/><circle cx="25" cy="7" r="4" fill="#ffb61d"/></svg>
   <h1>Suas finanças numa página só</h1><p>Contas, cartões, faturas, orçamentos e investimentos. O app mostra o que vence, quanto sobra no mês e como fica o saldo dia a dia até o próximo recebimento.</p>
   <ul><li>Lançamentos fixos e parcelados, com edição só deste ou dos próximos</li><li>Cartão de crédito com fechamento, vencimento e limite disponível</li><li>Lançamento por texto, várias linhas de uma vez</li><li>Importação de extrato OFX ou CSV, com conciliação</li><li>Carteira de investimentos com rendimento descontando aportes</li></ul>
-  <div class="btns" style="margin-top:22px"><button class="btn pri" data-act="start-empty">Começar do zero</button><button class="btn acc" data-act="start-demo">Ver com dados de exemplo</button><button class="btn" data-act="jabu">Importar do Jabu</button></div>
-  <p class="hint" style="margin-top:14px">Os dados de exemplo podem ser removidos depois em Ajustes.</p></div>`;
+  <div class="btns" style="margin-top:22px"><button class="btn pri" data-act="start-empty">Começar do zero</button><button class="btn acc" data-act="start-demo">Ver com dados de exemplo</button><button class="btn" data-act="jabu">Importar do Jabu</button><button class="btn" data-act="restore-open">Restaurar um backup</button></div>
+  <p class="hint" style="margin-top:14px">Qualquer escolha já fica gravada. Os dados de exemplo podem ser removidos depois em Ajustes.</p></div>`;
 }
 
 /* ============ render ============ */
 let rq=0;
 function render(){
   memo={}; slots.length=0; $('#nav').innerHTML=navHtml();
+  if(CARREGANDO){document.body.classList.add('is-empty');$('#main').innerHTML=`<div class="welcome" aria-live="polite"><h1>Carregando seus dados…</h1><p>${CARGA}</p></div>`;return}
   const empty=!L('acc').length&&!L('cat').length; document.body.classList.toggle('is-empty',empty);
   const r=route(); const v={inicio:vInicio,lancamentos:vLanc,contas:vContas,cartoes:vCartoes,orcamentos:vOrc,relatorios:vRel,investimentos:vInv,ajustes:vAjustes}[r];
   const m=$('#main'); const keepFocus=document.activeElement&&document.activeElement.id==='f-q';
-  m.innerHTML=empty?vWelcome():(PREVIEW?`<div class="alert info preview"><div><b>Você está vendo dados de exemplo</b>, para conhecer o app. Nada disso foi salvo.</div><div class="btns"><button class="btn pri" data-act="pv-zero">Começar com meus dados</button><button class="btn" data-act="jabu">Importar do Jabu</button><button class="btn" data-act="pv-keep">Manter o exemplo</button></div></div>`:'')+v();
+  m.innerHTML=(!LSOK&&!synced?`<div class="alert bad" role="alert" style="margin-bottom:14px"><div><b>Este navegador não está guardando seus dados.</b> O que você lançar some ao fechar a página. Abra fora da navegação privada ou libere o armazenamento deste site. Enquanto isso, copie um backup em Ajustes.</div></div>`:'')+(empty?vWelcome():v());
   $$('.cslot',m).forEach(el=>{el.innerHTML=slots[+el.dataset.i](Math.max(280,Math.round(el.clientWidth)||640))});
   if(keepFocus){const q=$('#f-q');if(q){q.focus();q.setSelectionRange(q.value.length,q.value.length)}}
   const cf=$('#cfg-form'); if(cf)cf.onsubmit=e=>{e.preventDefault();const u=parseMoney($('#c-usd').value),g=parseMoney($('#c-goal').value);put({...cfg(),usdRate:u>0?Math.round(u*1e4)/1e4:null,investGoal:g>0?r2(g):null});toast('Ajustes salvos');render()};
@@ -1222,11 +1227,19 @@ function quickPreview(items,text){
 
 /* --- backup --- */
 const backupText=()=>JSON.stringify({app:'organizia',v:1,at:new Date().toISOString(),items:Object.values(DB)});
+function restoreModal(){
+  openModal(mh('Restaurar um backup')+`<div class="modal-b"><p class="hint" style="margin-top:0">Use o backup copiado ou baixado em Ajustes, na versão do app em que seus dados estão.</p>
+    <div class="fld" style="margin-bottom:10px"><label for="rb-file">Arquivo de backup</label><input id="rb-file" type="file" accept=".json,application/json"></div>
+    <div class="fld"><label for="rb-txt">Ou cole o texto do backup</label><textarea id="rb-txt" rows="4" placeholder="Cole aqui o JSON"></textarea></div></div>
+    <div class="modal-f"><button class="btn" data-act="close">Cancelar</button><button class="btn pri" id="rb-go">Restaurar</button></div>`);
+  $('#rb-file').onchange=e=>{const f=e.target.files[0];if(f)f.text().then(restoreBackup,()=>toast('Não consegui ler o arquivo'))};
+  $('#rb-go').onclick=()=>restoreBackup($('#rb-txt').value);
+}
 function restoreBackup(txt){
   let j;try{j=JSON.parse(txt)}catch(_){return toast('Backup inválido')}
   if(j&&j.cadastros)return jabuPreview(j);
   const items=Array.isArray(j)?j:j&&j.items;if(!Array.isArray(items))return toast('Backup inválido');
-  confirmBox(`Restaurar ${items.length} itens? Itens com o mesmo identificador serão substituídos.`,'Restaurar',()=>{if(PREVIEW){PREVIEW=false;DB={};memo={}}for(const o of items)if(o&&o.id&&o.t)put(o);render();toast('Backup restaurado')},false);
+  confirmBox(`Restaurar ${items.length} itens? Itens com o mesmo identificador serão substituídos.`,'Restaurar',()=>{for(const o of items)if(o&&o.id&&o.t)put(o);render();toast('Backup restaurado')},false);
 }
 
 /* --- importar do Jabu: lê o JSON exportado pelo módulo financeiro do Jabu --- */
@@ -1249,7 +1262,7 @@ function jabuPlan(j){
     for(const p of contas)for(const d of new Set([p.date,...p.done])){ const k=p.i+'@'+d, dd=Math.abs(ddiff(d,g.date));
       if(used.has(k)||dd>win||Math.abs(val(p,d)-g.amount)>0.101||!jSame(p.desc,g.desc))continue; if(!best||dd<best.dd)best={p,d,dd,k} }
     if(best){used.add(best.k);g.dup={d:best.d,sure:best.dd<=3};if(!best.p.cat&&!best.p.catDup)best.p.catDup=g.cat} }
-  const jids=PREVIEW?new Set():new Set(Object.values(DB).map(o=>o.jid).filter(Boolean));
+  const jids=new Set(Object.values(DB).map(o=>o.jid).filter(Boolean));
   for(const r of rows){
     r.already=jids.has(r.jid);
     if(r.kind==='despesa'||r.kind==='receita'){const s=suggestCat(r.desc,r.kind);r.catSel=r.cat||r.catDup||r.auto||(s&&DB[s]?DB[s].name:'')}
@@ -1260,7 +1273,6 @@ function jabuPlan(j){
   return {rows,anchor:an?{mes:an.mes,saldo:+an.saldo_inicial_informado}:null,holds:arr(j.carteira).filter(h=>h&&h.instituicao&&h.investimento)};
 }
 function jabuApply(j,plan,pick){
-  if(PREVIEW){PREVIEW=false;DB={};dirty={};memo={}}
   ensureCats();
   let acc=pick.acc&&DB[pick.acc]; const fresh=!acc;
   if(fresh){acc={id:uid('acc'),t:'acc',name:'Conta principal',kind:'corrente',opening:0,color:'#1f3c88'};put(acc)}
@@ -1313,7 +1325,7 @@ function jabuPreview(j){
   const plan=jabuPlan(j), rows=plan.rows.slice().sort((a,b)=>a.date.localeCompare(b.date)||jt(a.desc).localeCompare(jt(b.desc))||a.i-b.i);
   if(!rows.length&&!plan.holds.length){openModal(mh('Importar do Jabu')+`<div class="modal-b"><p style="margin:0">Esse arquivo não tem lançamentos nem carteira para importar.</p></div><div class="modal-f"><button class="btn" data-act="close">Fechar</button></div>`);return}
   const inp='border:1px solid var(--line);border-radius:8px;padding:5px 7px;background:var(--surface);font-size:13px';
-  const CL={}; for(const k of ['despesa','receita']){const m=new Map(), base=PREVIEW||!cats(k).length?DEF_CATS[k].map(x=>x[0]):cats(k).map(c=>c.name);
+  const CL={}; for(const k of ['despesa','receita']){const m=new Map(), base=!cats(k).length?DEF_CATS[k].map(x=>x[0]):cats(k).map(c=>c.name);
     for(const n of [...base,...rows.filter(r=>r.kind===k).map(r=>r.catSel)])if(n&&!m.has(norm(n)))m.set(norm(n),n); CL[k]=m}
   const catSel=r=>{const m=CL[r.kind];if(!m)return '';return `<select id="jb-c-${r.i}" style="${inp};max-width:168px" aria-label="Categoria">${opts([...m.values()].sort((a,b)=>a.localeCompare(b,'pt')).map(n=>[n,n]),m.get(norm(r.catSel))||'','Sem categoria')}</select>`};
   const info=r=>{ if(r.src==='gasto')return 'gasto do dia a dia'; if(r.src==='aporte')return r.kind;
@@ -1327,7 +1339,7 @@ function jabuPreview(j){
   openModal(mh('Conferir dados do Jabu')+`<div class="modal-b">
   <p style="margin:0">${n('receita')} receitas · ${n('conta')} contas, ${rows.filter(r=>r.src==='conta'&&r.rec).length} delas fixas · ${n('gasto')} gastos do dia a dia · ${n('aporte')} ${n('aporte')===1?'aporte':'aportes'}${plan.holds.length?` · ${plan.holds.length} investimentos na carteira`:''}</p>
   ${dups.length?`<div class="alert info"><div><b>${dups.length} gastos repetem contas</b> que já estão no arquivo com o mesmo valor, somando <b class="money">${money(sumA(dups))}</b>. Ficaram desmarcados para não contar duas vezes. Marque de volta os que forem gastos diferentes.</div></div>`:''}
-  <div class="frow"><div class="fld"><label for="jb-acc">Conta que recebe os lançamentos</label><select id="jb-acc"><option value="">Criar a conta “Conta principal”</option>${PREVIEW?'':opts(accs().map(a=>[a.id,a.name]),'')}</select></div>
+  <div class="frow"><div class="fld"><label for="jb-acc">Conta que recebe os lançamentos</label><select id="jb-acc"><option value="">Criar a conta “Conta principal”</option>${opts(accs().map(a=>[a.id,a.name]),'')}</select></div>
   <div class="fld"><label for="jb-saldo">Saldo dessa conta hoje (opcional)</label><input id="jb-saldo" inputmode="decimal" placeholder="ex.: 12.500,00"><span class="hint">${plan.anchor?`Em branco, a conta nova parte de ${money(plan.anchor.saldo)} em 1º de ${MES[+plan.anchor.mes.slice(5)-1]}, o saldo inicial informado no Jabu.`:'Em branco, a conta nova começa em zero.'}</span></div></div>
   ${plan.holds.length?`<label class="check"><input type="checkbox" id="jb-holds" checked> Trazer a carteira, com histórico, e a cotação do dólar</label>`:''}
   <div class="btns"><button class="btn sm" id="jb-all">Marcar todos</button><button class="btn sm" id="jb-def">Voltar à sugestão</button></div>
@@ -1387,7 +1399,7 @@ function seedDemo(quiet){
 /* ============ eventos ============ */
 function move(k){U.ym=addM(U.ym,k);render()}
 document.addEventListener('click',e=>{
-  const el=e.target.closest('[data-act]'); if(!el)return;
+  const el=e.target.closest('[data-act]'); if(!el||CARREGANDO)return;
   if(el.closest('.modal')&&!['close','tx-kind','rep','ap-kind','pick-color','del-tx','del-hist'].includes(el.dataset.act))return;
   const a=el.dataset.act, id=el.dataset.id;
   if(a==='toggle-paid'||a==='del-pay'||a==='del-hist')e.stopPropagation();
@@ -1418,11 +1430,9 @@ document.addEventListener('click',e=>{
     case 'new-aporte':aporteModal();break;
     case 'ap-kind':{$$('[data-act=ap-kind]').forEach(b=>b.classList.toggle('on',b===el));$('#apf').dataset.kind=el.dataset.v;$('#ap-acclbl').textContent=el.dataset.v==='aporte'?'Sai da conta':'Entra na conta';break}
     case 'pick-color':{const lab=el.closest('label');const r=lab.querySelector('input');r.checked=true;lab.parentElement.querySelectorAll('.ico').forEach(i=>i.style.outline='none');el.style.outline='3px solid var(--accent)';break}
-    case 'pv-zero':PREVIEW=false;DB={};memo={};startEmpty();break;
-    case 'pv-keep':PREVIEW=false;for(const o of Object.values(DB))put(o);render();toast('Exemplo salvo. Remova quando quiser em Ajustes.');break;
-    case 'start-empty':PREVIEW=false;startEmpty();break; case 'start-demo':PREVIEW=false;seedDemo();break;
+    case 'start-empty':startEmpty();break; case 'start-demo':seedDemo();break; case 'restore-open':restoreModal();break;
     case 'clear-demo':confirmBox('Remover todos os dados de exemplo? O que você cadastrou continua.','Remover',()=>{for(const o of Object.values(DB))if(o.demo)del(o.id);render();toast('Exemplo removido')});break;
-    case 'wipe':confirmBox('Apagar <b>todos</b> os seus dados financeiros? Não dá para desfazer. Copie um backup antes, se quiser.','Apagar tudo',()=>{PREVIEW=false;for(const id of Object.keys(DB))del(id);render()});break;
+    case 'wipe':confirmBox('Apagar <b>todos</b> os seus dados financeiros? Não dá para desfazer. Copie um backup antes, se quiser.','Apagar tudo',()=>{for(const id of Object.keys(DB))del(id);render()});break;
     case 'backup-copy':{const txt=backupText();$('#bk').value=txt;try{navigator.clipboard.writeText(txt).then(()=>toast('Backup copiado'),()=>toast('Copie o texto do campo abaixo'))}catch(_){toast('Copie o texto do campo abaixo')}break}
     case 'backup-restore':restoreBackup($('#bk').value);break;
     case 'backup-download':{const txt=backupText(),l=document.createElement('a');l.href=URL.createObjectURL(new Blob([txt],{type:'application/json'}));l.download='organizia-backup-'+today()+'.json';document.body.appendChild(l);l.click();l.remove();setTimeout(()=>URL.revokeObjectURL(l.href),5000);toast('Backup baixado');break}
@@ -1440,7 +1450,9 @@ $('#modal-bg').addEventListener('mousedown',e=>{if(e.target.id==='modal-bg')clos
 addEventListener('hashchange',()=>{scrollTo(0,0);render()});
 let rw=innerWidth,rt; addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{if(innerWidth!==rw){rw=innerWidth;render()}},200)});
 
-lsLoad(); if(!Object.keys(DB).length){PREVIEW=true;seedDemo(true)} render(); connectDb(); connectAi(); setTimeout(expandInbox,1500);
+lsLoad(); try{localStorage.setItem(LS+'-teste','1');localStorage.removeItem(LS+'-teste')}catch(e){LSOK=false}
+if(!Object.keys(DB).length&&!STANDALONE)CARREGANDO=true;   /* no Claude, primeiro a conta responde; fora dele, abre na tela de boas-vindas */
+render(); connectDb(); connectAi(); setTimeout(expandInbox,1500);
 </script>
 </body>
 </html>
